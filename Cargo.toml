@@ -1,0 +1,20 @@
+[package]
+name = "limit-order-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alloy = { version = "0.1", features = ["full"] }
+chrono = "0.4"
+color-eyre = "0.6"
+dotenvy = "0.15"
+ethers-signers = "2.0"
+futures-util = "0.3"
+jsonrpsee = { version = "0.20", features = ["http-client"]}
+mev-share-sse = "0.3.0"
+mev-share-rpc-api = { git = "https://github.com/paradigmxyz/mev-share-rs.git", rev="d998465221dade7bdd3009f422769da4686cb543" }
+tokio = { version = "1", default-features = false, features = ["macros"]}
+tower = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+url = "2.5"
