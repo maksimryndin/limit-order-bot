@@ -1,10 +1,10 @@
 use alloy::{
     consensus::TypedTransaction,
-    network::{Ethereum, EthereumWallet, TransactionBuilder, TxSigner},
+    network::{Ethereum, EthereumWallet, TxSigner},
     primitives::{Address, U256},
     providers::{
         fillers::{FillProvider, JoinFill, WalletFiller},
-        Identity, ProviderBuilder, ReqwestProvider, WalletProvider,
+        Identity, Provider, ProviderBuilder, ReqwestProvider, WalletProvider,
     },
     signers::local::PrivateKeySigner,
     sol,
@@ -12,21 +12,24 @@ use alloy::{
 };
 use chrono::{TimeDelta, Utc};
 use color_eyre::eyre::{bail, ensure, Result};
-use ethers_signers::{LocalWallet, Signer};
+use ethers_signers::LocalWallet;
 use futures_util::StreamExt;
 use jsonrpsee::http_client::{transport::Error as HttpError, HttpClientBuilder};
-use mev_share_rpc_api::{BundleItem, FlashbotsSignerLayer, MevApiClient, SendBundleRequest};
+use mev_share_rpc_api::{
+    BundleItem, FlashbotsSignerLayer, Inclusion, MevApiClient, SendBundleRequest,
+};
 use mev_share_sse::{Event, EventClient};
 use tower::ServiceBuilder;
 
 use std::env;
 use std::str::FromStr;
-use tracing::{debug, info};
+use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use url::Url;
 
 sol!(
     #[allow(missing_docs)]
+    #[allow(clippy::too_many_arguments)]
     #[sol(rpc)]
     UNISWAP_V2_ROUTER,
     "src/abi/univ2router.json"
@@ -34,6 +37,7 @@ sol!(
 
 sol!(
     #[allow(missing_docs)]
+    #[allow(clippy::too_many_arguments)]
     #[sol(rpc)]
     UNISWAP_V2_FACTORY,
     "src/abi/univ2factory.json"
@@ -41,6 +45,7 @@ sol!(
 
 sol!(
     #[allow(missing_docs)]
+    #[allow(clippy::too_many_arguments)]
     #[sol(rpc)]
     ERC20,
     "src/abi/erc20.json"
@@ -53,6 +58,8 @@ const UNISWAP_FACTORY_ADDRESS: &str = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6
 const DISCOUNT_IN_BPS: u64 = 40;
 // try sending a backrun bundle for this many blocks:
 const BLOCKS_TO_TRY: u64 = 24;
+// WETH/DAI token addresses can be obtained here
+// https://coinmarketcap.com/dexscan/ethereum/0x60594a405d53811d3bc4766596efd80fd545a270/
 // WETH:
 const SELL_TOKEN_ADDRESS: &str = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
 const SELL_TOKEN_AMOUNT: u64 = 100_000_000;
@@ -88,6 +95,7 @@ struct Searcher {
     read_provider: ReqwestProvider,
     write_provider: RPCProvider,
     fb_client: Box<dyn MevApiClient>,
+    signer_address: Address,
 }
 
 impl Searcher {
@@ -113,13 +121,14 @@ impl Searcher {
         let fb_client = Box::new(
             HttpClientBuilder::default()
                 .set_middleware(service_builder)
-                .build(MEV_RPC_URL)?,
+                .build(fb_rpc_url)?,
         );
 
         Ok(Self {
             read_provider,
             write_provider,
             fb_client,
+            signer_address,
         })
     }
 
@@ -127,12 +136,8 @@ impl Searcher {
         &self.read_provider
     }
 
-    fn write_provider(&self) -> &RPCProvider {
-        &self.write_provider
-    }
-
     fn signer_address(&self) -> Address {
-        self.write_provider.wallet().default_signer().address()
+        self.signer_address
     }
 
     async fn approve_token_to_router(
@@ -190,7 +195,7 @@ impl Searcher {
         Ok(extra_output_amount)
     }
 
-    async fn get_signed_backrun_tx(&self, output_amount: U256) -> Result<Vec<u8>> {
+    async fn get_signed_backrun_tx(&self, output_amount: U256, nonce: u64) -> Result<Vec<u8>> {
         let router_contract =
             UNISWAP_V2_ROUTER::new(Address::from_str(UNISWAP_V2_ADDRESS)?, &self.write_provider);
         let now = Utc::now();
@@ -207,6 +212,7 @@ impl Searcher {
                 time_in_force_seconds.timestamp().try_into()?,
             )
             .chain_id(1)
+            .nonce(nonce)
             .gas(TX_GAS_LIMIT)
             .max_fee_per_gas(MAX_GAS_PRICE)
             .max_priority_fee_per_gas(MAX_PRIORITY_FEE);
@@ -228,7 +234,8 @@ impl Searcher {
 
     async fn backrun_attempt(
         &self,
-        current_block_number: U256,
+        current_block_number: u64,
+        nonce: u64,
         pending_tx_hash: [u8; 32],
     ) -> Result<()> {
         let mut output_amount = self.get_buy_token_amount_with_extra().await?;
@@ -237,7 +244,7 @@ impl Searcher {
             info!("Even with extra amount, not enough BUY token: {output_amount}. Setting to amount cut-off ({cutoff})");
             output_amount = cutoff;
         }
-        let signed_tx_bytes = self.get_signed_backrun_tx(output_amount).await?;
+        let signed_tx_bytes = self.get_signed_backrun_tx(output_amount, nonce).await?;
 
         let bundle = SendBundleRequest {
             bundle_body: vec![
@@ -249,11 +256,13 @@ impl Searcher {
                     can_revert: false,
                 },
             ],
+            inclusion: Inclusion::at_block(current_block_number + 1),
             ..Default::default()
         };
 
         // Send bundle
         let resp = self.fb_client.send_bundle(bundle).await;
+        info!("Got a bundle response: {:?}", resp);
 
         // let sim_res = client.sim_bundle(bundle, Default::default()).await;
         // println!("Got a simulation response: {:?}", sim_res);
@@ -300,12 +309,13 @@ async fn main() -> Result<()> {
         "pair address should be non-zero"
     );
     info!("pair address: {}", pair_address);
-    // searcher
-    //     .approve_token_to_router(
-    //         sell_address,
-    //         Address::from_str(UNISWAP_V2_ADDRESS)?,
-    //     )
-    //     .await?;
+    searcher
+        .approve_token_to_router(sell_address, Address::from_str(UNISWAP_V2_ADDRESS)?)
+        .await?;
+    let nonce = searcher
+        .read_provider()
+        .get_transaction_count(searcher.signer_address())
+        .await?;
     while let Some(event) = stream.next().await {
         if let Ok(event) = event {
             if !event_is_related_to_pair(&event, pair_address) {
@@ -313,6 +323,10 @@ async fn main() -> Result<()> {
                 continue;
             }
             info!("It's a match: {}", event.hash);
+            let current_block_number: u64 = searcher.read_provider().get_block_number().await?;
+            searcher
+                .backrun_attempt(current_block_number, nonce, *event.hash)
+                .await?;
             break;
         }
     }
