@@ -69,9 +69,9 @@ const BUY_TOKEN_AMOUNT_CUTOFF: u64 = SELL_TOKEN_AMOUNT * 1800;
 const MEV_SHARE_EVENTS: &str = "https://mev-share.flashbots.net";
 const MEV_RPC_URL: &str = "https://relay.flashbots.net:443";
 const TX_GAS_LIMIT: u128 = 400_000;
-const MAX_GAS_PRICE: u128 = 20;
-const MAX_PRIORITY_FEE: u128 = 5;
-const GWEI: u64 = 10u64.pow(9);
+const MAX_GAS_PRICE: u128 = 40;
+const MAX_PRIORITY_FEE: u128 = 0;
+const GWEI: u128 = 10u128.pow(9);
 
 fn event_is_related_to_pair(event: &Event, pair_address: Address) -> bool {
     event
@@ -177,21 +177,22 @@ impl Searcher {
         // https://docs.uniswap.org/contracts/v2/reference/smart-contracts/router-02#swapexacttokensfortokens
         let UNISWAP_V2_ROUTER::swapExactTokensForTokensReturn { amounts } = router_contract
             .swapExactTokensForTokens(
-                U256::from(SELL_TOKEN_AMOUNT),
-                U256::from(1u8),
+                U256::from(SELL_TOKEN_AMOUNT), // The amount of input tokens (WETH) to send.
+                U256::from(1u8), // The minimum amount of output tokens (DAI) that must be received for the transaction not to revert.
                 vec![
                     Address::from_str(SELL_TOKEN_ADDRESS)?,
                     Address::from_str(BUY_TOKEN_ADDRESS)?,
-                ],
-                self.signer_address(),
-                time_in_force_seconds.timestamp().try_into()?,
+                ], // Pools for each consecutive pair of addresses must exist and have liquidity.
+                self.signer_address(), // Recipient of the output tokens.
+                time_in_force_seconds.timestamp().try_into()?, // Unix timestamp after which the transaction will revert.
             )
             .call()
             .await?;
         let normal_output_amount = amounts[1];
         let extra_output_amount = normal_output_amount
             * (U256::from(10000) + U256::from(DISCOUNT_IN_BPS))
-            / U256::from(10000);
+            / U256::from(10000); // +40 bps  or 1.004 multiplier, see https://www.investopedia.com/ask/answers/what-basis-point-bps/
+        info!("Normally {SELL_TOKEN_AMOUNT} of {SELL_TOKEN_ADDRESS} gets you {normal_output_amount} of {BUY_TOKEN_ADDRESS}. Let's try for {extra_output_amount}");
         Ok(extra_output_amount)
     }
 
@@ -214,8 +215,8 @@ impl Searcher {
             .chain_id(1)
             .nonce(nonce)
             .gas(TX_GAS_LIMIT)
-            .max_fee_per_gas(MAX_GAS_PRICE)
-            .max_priority_fee_per_gas(MAX_PRIORITY_FEE);
+            .max_fee_per_gas(MAX_GAS_PRICE * GWEI)
+            .max_priority_fee_per_gas(MAX_PRIORITY_FEE * GWEI);
         let tx = tx_builder.as_ref().clone().build_typed_tx();
         let Ok(TypedTransaction::Eip1559(mut tx)) = tx else {
             bail!("expect tx in EIP1559")
@@ -238,13 +239,13 @@ impl Searcher {
         nonce: u64,
         pending_tx_hash: [u8; 32],
     ) -> Result<()> {
-        let mut output_amount = self.get_buy_token_amount_with_extra().await?;
+        let mut extra_output_amount = self.get_buy_token_amount_with_extra().await?;
         let cutoff = U256::from(BUY_TOKEN_AMOUNT_CUTOFF);
-        if output_amount < cutoff {
-            info!("Even with extra amount, not enough BUY token: {output_amount}. Setting to amount cut-off ({cutoff})");
-            output_amount = cutoff;
+        if extra_output_amount < cutoff {
+            info!("Even with extra amount, not enough BUY token: {extra_output_amount}. Setting to amount cut-off ({cutoff})");
+            extra_output_amount = cutoff;
         }
-        let signed_tx_bytes = self.get_signed_backrun_tx(output_amount, nonce).await?;
+        let signed_tx_bytes = self.get_signed_backrun_tx(extra_output_amount, nonce).await?;
 
         let bundle = SendBundleRequest {
             bundle_body: vec![
@@ -327,7 +328,6 @@ async fn main() -> Result<()> {
             searcher
                 .backrun_attempt(current_block_number, nonce, *event.hash)
                 .await?;
-            break;
         }
     }
 
